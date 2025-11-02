@@ -1,0 +1,66 @@
+# Build directories
+build/
+out/
+bin/
+binaries/
+*/bin/
+*/build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!CMakePresets.json
+
+# Compiler outputs
+*.exe
+*.out
+*.app
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# IDE and editor files
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+
+# Database files
+*.db
+*.sqlite
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific (from your file list)
+cmake.db
+slmx.sqlite
+VSWorkspaceState.json
+ProjectSettings.json
+
+# Git-related
+*.orig
+
+# Dependency directories
+deps/
+third_party/
+external/
+
+# Package management
+conaninfo.txt
+conanbuildinfo.*
