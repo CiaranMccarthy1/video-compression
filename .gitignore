@@ -33,6 +33,13 @@ Makefile
 *.swp
 *.swo
 *~
+ # JetBrains (CLion, IntelliJ, Rider)
+.idea/                
+.idea_modules/
+cmake-build-*/
+*.iml
+*.ipr
+*.iws
 
 # Database files
 *.db
