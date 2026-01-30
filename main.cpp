@@ -17,6 +17,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h> // Required for HW accel
 }
 
 // --- RAII Wrappers for FFmpeg ---
@@ -56,6 +57,14 @@ struct SwsContextDeleter {
 };
 using SwsContextPtr = std::unique_ptr<SwsContext, SwsContextDeleter>;
 
+struct AVBufferRefDeleter {
+    void operator()(AVBufferRef* buf) const {
+        if (buf) av_buffer_unref(&buf);
+    }
+};
+using AVBufferRefPtr = std::unique_ptr<AVBufferRef, AVBufferRefDeleter>;
+
+
 // --- Data Structures ---
 
 struct VideoMetadata {
@@ -68,6 +77,22 @@ struct VideoMetadata {
     int changeThreshold;
 };
 
+// --- Helper for Format Negotiation ---
+
+static enum AVPixelFormat hw_pix_fmt;
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
+{
+    const enum AVPixelFormat *p;
+
+    for (p = pix_fmts; *p != -1; p++) {
+        if (*p == hw_pix_fmt)
+            return *p;
+    }
+
+    fprintf(stderr, "Failed to get HW surface format.\n");
+    return AV_PIX_FMT_NONE;
+}
+
 // --- Compressor Class ---
 
 class VideoCompressor {
@@ -77,6 +102,7 @@ private:
     int frameInterval;
     int keyframeInterval;
     int changeThreshold;
+    bool useCuda;
 
     int totalProcessedFrames = 0;
     int savedFrameCount = 0;
@@ -90,6 +116,7 @@ private:
     AVFormatContextPtr fmtCtx;
     AVCodecContextPtr codecCtx;
     SwsContextPtr swsCtx;
+    AVBufferRefPtr hwDeviceCtx;
     int videoStreamIdx = -1;
 
     VideoMetadata metadata{};
@@ -97,11 +124,16 @@ private:
     std::ofstream ofs;
     std::streampos headerPos;
 
+    // Track SwsContext state
+    int currentSwsW = -1;
+    int currentSwsH = -1;
+    enum AVPixelFormat currentSwsFormat = AV_PIX_FMT_NONE;
+
 public:
     VideoCompressor(const std::string& input, const std::string& output,
-        int interval = 10, int kfInterval = 30, int threshold = 15)
+        int interval, int kfInterval, int threshold, bool cuda)
         : inputFile(input), outputFile(output), frameInterval(interval),
-        keyframeInterval(kfInterval), changeThreshold(threshold) {
+        keyframeInterval(kfInterval), changeThreshold(threshold), useCuda(cuda) {
     }
 
     ~VideoCompressor() {
@@ -136,7 +168,18 @@ public:
 
         // 3. Setup Codec
         AVCodecParameters* codecParams = fmtCtx->streams[videoStreamIdx]->codecpar;
-        const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+        const AVCodec* codec = nullptr; 
+
+        if (useCuda) {
+            // Find a decoder that supports CUDA
+            // We iterate to find the decoder by ID, then check if it supports CUDA config
+            // Simple approach: find default decoder, check configs
+            codec = avcodec_find_decoder(codecParams->codec_id); 
+            // In a robust implementation, we might iterate av_codec_iterate to find a specific nvidia wrapper like h264_cuvid
+            // But avcodec_find_decoder usually returns the best generic one. We then enable HW config on it.
+        } else {
+             codec = avcodec_find_decoder(codecParams->codec_id);
+        }
 
         if (!codec) {
             std::cerr << "Unsupported codec" << std::endl;
@@ -154,6 +197,26 @@ public:
             return false;
         }
 
+        // HW Device Init
+        if (useCuda) {
+            AVBufferRef* ctx = nullptr;
+            int err = av_hwdevice_ctx_create(&ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+            if (err < 0) {
+                std::cerr << "Failed to create CUDA device. Error code: " << err << std::endl;
+                std::cerr << "Falling back to software decoding." << std::endl;
+                useCuda = false;
+            } else {
+                hwDeviceCtx.reset(ctx);
+                codecCtx->hw_device_ctx = av_buffer_ref(hwDeviceCtx.get());
+                
+                // Set callbacks
+                // We need to know which pixel format corresponds to the HW type
+                hw_pix_fmt = AV_PIX_FMT_CUDA;
+                codecCtx->get_format = get_hw_format;
+                std::cout << "[Info] CUDA hardware acceleration enabled." << std::endl;
+            }
+        }
+
         if (avcodec_open2(codecCtx.get(), codec, nullptr) < 0) {
             std::cerr << "Could not open codec" << std::endl;
             return false;
@@ -169,17 +232,11 @@ public:
         metadata.totalFrames = 0; 
 
         // 5. Setup SwsContext (Convert to YUV420P)
-        swsCtx.reset(sws_getContext(
-            codecCtx->width, codecCtx->height, codecCtx->pix_fmt,
-            codecCtx->width, codecCtx->height, AV_PIX_FMT_YUV420P,
-            SWS_BILINEAR, nullptr, nullptr, nullptr
-        ));
-
-        if (!swsCtx) {
-            std::cerr << "Could not initialize SWS context" << std::endl;
-            return false;
-        }
-
+        // If we are using CUDA, the output frame is NV12 or P010 usually, or CUDA surface.
+        // We will download it to SW memory first.
+        
+        // We defer SWS creation until we receive the first frame to know exactly what the SW format is.
+        
         // 6. Init Output File
         ofs.open(outputFile, std::ios::binary);
         if (!ofs) {
@@ -195,16 +252,16 @@ public:
     bool compress() {
         AVPacketPtr packet(av_packet_alloc());
         AVFramePtr frame(av_frame_alloc());
-        AVFramePtr scaledFrame(av_frame_alloc()); // Was rgbFrame, now generic
+        AVFramePtr swFrame(av_frame_alloc()); // To hold downloaded data
+        AVFramePtr scaledFrame(av_frame_alloc()); // Final YUV420P holder
 
-        if (!packet || !frame || !scaledFrame) {
+        if (!packet || !frame || !swFrame || !scaledFrame) {
             std::cerr << "Could not allocate packet/frame" << std::endl;
             return false;
         }
 
-        // Allocate buffer for YUV420P frame
+        // Allocate buffer for YUV420P frame (Destination)
         int numBytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, codecCtx->width, codecCtx->height, 1);
-        
         struct AvFreeDeleter { void operator()(void* p) const { av_free(p); } };
         std::unique_ptr<uint8_t, AvFreeDeleter> buffer((uint8_t*)av_malloc((size_t)numBytes));
         
@@ -240,18 +297,53 @@ public:
                     }
 
                     frameCount++;
+                    
+                    AVFrame* processingFrame = frame.get();
 
-                    // Scale to YUV420P
+                    // If HW surface, transfer to SW
+                    if (frame->format == hw_pix_fmt) {
+                         int err = av_hwframe_transfer_data(swFrame.get(), frame.get(), 0);
+                         if (err < 0) {
+                             char errbuf[AV_ERROR_MAX_STRING_SIZE];
+                             av_strerror(err, errbuf, AV_ERROR_MAX_STRING_SIZE);
+                             std::cerr << "Error transferring the data to system memory: " << errbuf << " (" << err << ")" << std::endl;
+                             av_frame_unref(frame.get());
+                             continue;
+                         }
+                         // Copy/Setup properties
+                         swFrame->pts = frame->pts;
+                         swFrame->best_effort_timestamp = frame->best_effort_timestamp;
+                         processingFrame = swFrame.get();
+                    }
+
+                    // Init/Re-init SwsContext if format changed or first time
+                    if (!swsCtx || 
+                        currentSwsW != processingFrame->width || 
+                        currentSwsH != processingFrame->height ||
+                        currentSwsFormat != processingFrame->format) {
+                         
+                        swsCtx.reset(sws_getContext(
+                            processingFrame->width, processingFrame->height, (enum AVPixelFormat)processingFrame->format,
+                            codecCtx->width, codecCtx->height, AV_PIX_FMT_YUV420P,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr
+                        ));
+                        
+                        currentSwsW = processingFrame->width;
+                        currentSwsH = processingFrame->height;
+                        currentSwsFormat = (enum AVPixelFormat)processingFrame->format;
+                    }
+
+                    // Scale/Convert to YUV420P
                     int h = sws_scale(swsCtx.get(),
-                        frame->data, frame->linesize,
-                        0, codecCtx->height,
+                        processingFrame->data, processingFrame->linesize,
+                        0, processingFrame->height,
                         scaledFrame->data, scaledFrame->linesize);
 
                     if (h <= 0) {
                         std::cerr << "sws_scale failed for frame " << frameCount << std::endl;
                     }
                     else {
-                        int64_t pts = (frame->pts != AV_NOPTS_VALUE) ? frame->pts : frame->best_effort_timestamp;
+                        int64_t pts = (processingFrame->pts != AV_NOPTS_VALUE) ? processingFrame->pts : processingFrame->best_effort_timestamp;
                         
                         if (frameCount % frameInterval == 0) {
                             processAndWriteFrame(scaledFrame.get(), pts);
@@ -262,6 +354,7 @@ public:
                         }
                     }
                     av_frame_unref(frame.get());
+                    av_frame_unref(swFrame.get());
                 }
             }
             av_packet_unref(packet.get());
@@ -277,6 +370,24 @@ public:
     }
 
 private:
+    struct SwsContextWrapper {
+        SwsContext* ctx = nullptr;
+        int sourceW = 0;
+        int sourceH = 0;
+        ~SwsContextWrapper() { if (ctx) sws_freeContext(ctx); }
+        void reset(SwsContext* c, int w, int h) {
+            if (ctx) sws_freeContext(ctx);
+            ctx = c;
+            sourceW = w;
+            sourceH = h;
+        }
+        SwsContext* get() { return ctx; }
+        operator bool() { return ctx != nullptr; }
+    };
+    // Shadowing the smart ptr with this simple wrapper to track dims if needed, 
+    // but for now I'll stick to the smart ptr and re-create if needed.
+    // Re-using the class member swsCtx.
+
     void writeHeader() {
         const char* magic = "IGEDLT2";
         ofs.write(magic, 8);
@@ -513,20 +624,30 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    // Standard setup same as before
     std::cout << "Start of program" << std::endl;
 
-    if (argc < 3) {
+    bool useCuda = false;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--cuda") {
+            useCuda = true;
+        } else {
+            args.push_back(arg);
+        }
+    }
+
+    if (args.size() < 2) {
         std::cout << "Video Delta Compressor (YUV420P Streaming)" << std::endl;
-        std::cout << "Usage: " << argv[0] << " <input.mp4> <output.ige> [frame_interval] [keyframe_interval] [change_threshold]" << std::endl;
+        std::cout << "Usage: " << argv[0] << " <input.mp4> <output.ige> [--cuda] [frame_interval] [keyframe_interval] [change_threshold]" << std::endl;
         return 1;
     }
 
-    std::string inputFile = argv[1];
-    std::string outputFile = argv[2];
-    int frameInterval = (argc >= 4) ? std::atoi(argv[3]) : 10;
-    int keyframeInterval = (argc >= 5) ? std::atoi(argv[4]) : 30;
-    int changeThreshold = (argc >= 6) ? std::atoi(argv[5]) : 15;
+    std::string inputFile = args[0];
+    std::string outputFile = args[1];
+    int frameInterval = (args.size() >= 3) ? std::stoi(args[2]) : 10;
+    int keyframeInterval = (args.size() >= 4) ? std::stoi(args[3]) : 30;
+    int changeThreshold = (args.size() >= 5) ? std::stoi(args[4]) : 15;
 
     std::cout << "Video Delta Compressor" << std::endl;
     std::cout << "========================================" << std::endl;
@@ -534,12 +655,13 @@ int main(int argc, char* argv[]) {
     std::cout << "Output: " << outputFile << std::endl;
     std::cout << "Frame interval: " << frameInterval << std::endl;
     std::cout << "Keyframe interval: " << keyframeInterval << std::endl;
-    std::cout << "Change threshold: " << changeThreshold << std::endl << std::endl;
+    std::cout << "Change threshold: " << changeThreshold << std::endl;
+    std::cout << "HW Acceleration: " << (useCuda ? "CUDA" : "None") << std::endl << std::endl;
 
     auto startTime = std::chrono::high_resolution_clock::now();
     
     {
-        VideoCompressor compressor(inputFile, outputFile, frameInterval, keyframeInterval, changeThreshold);
+        VideoCompressor compressor(inputFile, outputFile, frameInterval, keyframeInterval, changeThreshold, useCuda);
 
         if (!compressor.initialize()) {
             std::cerr << "Failed to initialize compressor" << std::endl;
