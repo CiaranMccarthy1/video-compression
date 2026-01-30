@@ -1,11 +1,29 @@
-﻿#include <iostream>
-#include <fstream>  
+﻿/**
+ * @file main.cpp
+ * @brief Video Delta Compressor
+ *
+ * This tool compresses video files using a custom delta compression algorithm specifically designed
+ * to reduce file size for archival or specific streaming use cases. It supports optional CUDA
+ * hardware acceleration for decoding, with a robust fallback to software decoding.
+ *
+ * Key Features:
+ * - Delta Compression: Stores differences between frames rather than full frames.
+ * - Keyframe Management: Periodically inserts full keyframes for recovery.
+ * - YUV420P Color Space: Optimizes chroma subsampling for reduced size.
+ * - Hardware Acceleration: Optional NVIDIA CUDA decoding support.
+ * - Resource Management: Uses C++ RAII (Resource Acquisition Is Initialization) for FFmpeg structures.
+ *
+ * @author Open Source Contributor
+ */
+
+#include <iostream>
+#include <fstream>
 #include <vector>
 #include <cstring>
 #include <cstdint>
 #include <chrono>
 #include <cmath>
-#include <filesystem> 
+#include <filesystem>
 #include <string>
 #include <algorithm>
 #include <map>
@@ -17,10 +35,14 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
-#include <libavutil/hwcontext.h> // Required for HW accel
+#include <libavutil/hwcontext.h>
 }
 
-// --- RAII Wrappers for FFmpeg ---
+// -----------------------------------------------------------------------------
+// RAII Wrappers for FFmpeg Resources
+// These custom deleters ensure that FFmpeg C-style structs are freed correctly
+// when they go out of scope, preventing memory leaks.
+// -----------------------------------------------------------------------------
 
 struct AVFormatContextDeleter {
     void operator()(AVFormatContext* ctx) const {
@@ -64,37 +86,56 @@ struct AVBufferRefDeleter {
 };
 using AVBufferRefPtr = std::unique_ptr<AVBufferRef, AVBufferRefDeleter>;
 
+// -----------------------------------------------------------------------------
+// Data Structures
+// -----------------------------------------------------------------------------
 
-// --- Data Structures ---
-
+/**
+ * @brief Metadata header for the compressed video file format.
+ */
 struct VideoMetadata {
-    int width;
-    int height;
-    int frameInterval;
-    int64_t duration;
-    int totalFrames;
-    int keyframeInterval;
-    int changeThreshold;
+    int width;              ///< Video width in pixels.
+    int height;             ///< Video height in pixels.
+    int frameInterval;      ///< Step size for processing frames (e.g., every 10th frame).
+    int64_t duration;       ///< Total duration in AV_TIME_BASE units.
+    int totalFrames;        ///< Total number of sampled frames stored in the file.
+    int keyframeInterval;   ///< Interval at which full keyframes are inserted.
+    int changeThreshold;    ///< Sensitivity threshold for delta changes (0-255).
 };
 
-// --- Helper for Format Negotiation ---
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
 
-static enum AVPixelFormat hw_pix_fmt;
+/** Global state for HW Pixel Format negotiation. Use with care. */
+static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
+
+/**
+ * @brief Callback function used by FFmpeg to negotiate the hardware pixel format.
+ * 
+ * @param ctx The codec context.
+ * @param pix_fmts The list of available pixel formats supplied by the decoder.
+ * @return The selected hardware pixel format or AV_PIX_FMT_NONE if not found.
+ */
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
 {
     const enum AVPixelFormat *p;
-
     for (p = pix_fmts; *p != -1; p++) {
         if (*p == hw_pix_fmt)
             return *p;
     }
-
     fprintf(stderr, "Failed to get HW surface format.\n");
     return AV_PIX_FMT_NONE;
 }
 
-// --- Compressor Class ---
+// -----------------------------------------------------------------------------
+// Video Compressor Class
+// -----------------------------------------------------------------------------
 
+/**
+ * @class VideoCompressor
+ * @brief Handles the full pipeline of opening, decoding, compressing, and saving video data.
+ */
 class VideoCompressor {
 private:
     std::string inputFile;
@@ -107,29 +148,43 @@ private:
     int totalProcessedFrames = 0;
     int savedFrameCount = 0;
     
-    // Statistics
+    // Statistics for final reporting
     size_t keyframeCount = 0;
     size_t totalKeyframeBytes = 0;
     size_t totalDeltaBytes = 0;
 
-    // Resources
+    // FFmpeg Resources
     AVFormatContextPtr fmtCtx;
     AVCodecContextPtr codecCtx;
     SwsContextPtr swsCtx;
     AVBufferRefPtr hwDeviceCtx;
     int videoStreamIdx = -1;
 
+    // File I/O
     VideoMetadata metadata{};
-    std::vector<uint8_t> lastFrame;
+    std::vector<uint8_t> lastFrame; // Holds the previously processed frame for delta calculation
     std::ofstream ofs;
-    std::streampos headerPos;
+    std::streampos headerPos;       // File position to rewrite header metadata at the end
 
-    // Track SwsContext state
+    // State Tracking for Reuse of SWS Context
     int currentSwsW = -1;
     int currentSwsH = -1;
     enum AVPixelFormat currentSwsFormat = AV_PIX_FMT_NONE;
 
+    // Error State
+    bool cudaErrorOccurred = false;
+
 public:
+    /**
+     * @brief Construct a new Video Compressor.
+     * 
+     * @param input Path to input video file.
+     * @param output Path to output compressed file.
+     * @param interval Frame step interval (e.g. process every Nth frame).
+     * @param kfInterval Keyframe interval (every N saved frames).
+     * @param threshold Delta threshold (difference required to register a pixel change).
+     * @param cuda Whether to attempt CUDA hardware acceleration.
+     */
     VideoCompressor(const std::string& input, const std::string& output,
         int interval, int kfInterval, int threshold, bool cuda)
         : inputFile(input), outputFile(output), frameInterval(interval),
@@ -137,10 +192,19 @@ public:
     }
 
     ~VideoCompressor() {
+        // Resources are automatically cleaned up by unique_ptr deleters
     }
 
+    /**
+     * @brief Initializes the FFmpeg context, codecs, and output file.
+     * 
+     * @return true if initialization is successful, false otherwise.
+     */
     bool initialize() {
-        // 1. Open Input
+        // Reset global HW state to prevent carry-over from previous runs
+        hw_pix_fmt = AV_PIX_FMT_NONE;
+
+        // Open input file
         AVFormatContext* rawFmtCtx = nullptr;
         if (avformat_open_input(&rawFmtCtx, inputFile.c_str(), nullptr, nullptr) < 0) {
             std::cerr << "Could not open input file: " << inputFile << std::endl;
@@ -148,12 +212,13 @@ public:
         }
         fmtCtx.reset(rawFmtCtx);
 
+        // Retrieve stream information
         if (avformat_find_stream_info(fmtCtx.get(), nullptr) < 0) {
             std::cerr << "Could not find stream information" << std::endl;
             return false;
         }
 
-        // 2. Find Video Stream
+        // Locate the primary video stream
         for (unsigned i = 0; i < fmtCtx->nb_streams; i++) {
             if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 videoStreamIdx = i;
@@ -166,17 +231,14 @@ public:
             return false;
         }
 
-        // 3. Setup Codec
+        // Initialize Codec Context
         AVCodecParameters* codecParams = fmtCtx->streams[videoStreamIdx]->codecpar;
         const AVCodec* codec = nullptr; 
 
         if (useCuda) {
-            // Find a decoder that supports CUDA
-            // We iterate to find the decoder by ID, then check if it supports CUDA config
-            // Simple approach: find default decoder, check configs
+            // In a production environment, we would explicitly iterate to find 'h264_cuvid' or similar.
+            // For general purposes, finding the default decoder logic handles negotiation callback.
             codec = avcodec_find_decoder(codecParams->codec_id); 
-            // In a robust implementation, we might iterate av_codec_iterate to find a specific nvidia wrapper like h264_cuvid
-            // But avcodec_find_decoder usually returns the best generic one. We then enable HW config on it.
         } else {
              codec = avcodec_find_decoder(codecParams->codec_id);
         }
@@ -197,7 +259,7 @@ public:
             return false;
         }
 
-        // HW Device Init
+        // Initialize Hardware Device (if CUDA requested)
         if (useCuda) {
             AVBufferRef* ctx = nullptr;
             int err = av_hwdevice_ctx_create(&ctx, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
@@ -209,8 +271,7 @@ public:
                 hwDeviceCtx.reset(ctx);
                 codecCtx->hw_device_ctx = av_buffer_ref(hwDeviceCtx.get());
                 
-                // Set callbacks
-                // We need to know which pixel format corresponds to the HW type
+                // Configure negotiation callback
                 hw_pix_fmt = AV_PIX_FMT_CUDA;
                 codecCtx->get_format = get_hw_format;
                 std::cout << "[Info] CUDA hardware acceleration enabled." << std::endl;
@@ -222,45 +283,47 @@ public:
             return false;
         }
 
-        // 4. Setup Metadata
+        // Store preliminary metadata
         metadata.width = codecCtx->width;
         metadata.height = codecCtx->height;
         metadata.frameInterval = frameInterval;
         metadata.keyframeInterval = keyframeInterval;
         metadata.changeThreshold = changeThreshold;
         metadata.duration = fmtCtx->duration;
-        metadata.totalFrames = 0; 
+        metadata.totalFrames = 0; // Will be updated during finalization
 
-        // 5. Setup SwsContext (Convert to YUV420P)
-        // If we are using CUDA, the output frame is NV12 or P010 usually, or CUDA surface.
-        // We will download it to SW memory first.
-        
-        // We defer SWS creation until we receive the first frame to know exactly what the SW format is.
-        
-        // 6. Init Output File
+        // Open Output File for Writing
         ofs.open(outputFile, std::ios::binary);
         if (!ofs) {
             std::cerr << "Could not open output file: " << outputFile << std::endl;
             return false;
         }
 
-        writeHeader(); // Write placeholder
+        writeHeader(); // Write initial header with placeholders
 
         return true;
     }
 
+    /**
+     * @brief Executes the main compression loop.
+     * 
+     * Reads frames from input, decodes (SW or HW), downloads if necessary, converts to YUV420P,
+     * compresses, and streams to disk.
+     * 
+     * @return true on success, false on failure (or if fallback is needed).
+     */
     bool compress() {
         AVPacketPtr packet(av_packet_alloc());
         AVFramePtr frame(av_frame_alloc());
-        AVFramePtr swFrame(av_frame_alloc()); // To hold downloaded data
-        AVFramePtr scaledFrame(av_frame_alloc()); // Final YUV420P holder
+        AVFramePtr swFrame(av_frame_alloc());     // Intermediate buffer for HW download
+        AVFramePtr scaledFrame(av_frame_alloc()); // Final buffer for YUV420P data
 
         if (!packet || !frame || !swFrame || !scaledFrame) {
             std::cerr << "Could not allocate packet/frame" << std::endl;
             return false;
         }
 
-        // Allocate buffer for YUV420P frame (Destination)
+        // Prepare destination buffer for YUV420P
         int numBytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, codecCtx->width, codecCtx->height, 1);
         struct AvFreeDeleter { void operator()(void* p) const { av_free(p); } };
         std::unique_ptr<uint8_t, AvFreeDeleter> buffer((uint8_t*)av_malloc((size_t)numBytes));
@@ -300,23 +363,26 @@ public:
                     
                     AVFrame* processingFrame = frame.get();
 
-                    // If HW surface, transfer to SW
+                    // Handle Hardware Transfer (GPU -> CPU)
                     if (frame->format == hw_pix_fmt) {
                          int err = av_hwframe_transfer_data(swFrame.get(), frame.get(), 0);
                          if (err < 0) {
                              char errbuf[AV_ERROR_MAX_STRING_SIZE];
                              av_strerror(err, errbuf, AV_ERROR_MAX_STRING_SIZE);
                              std::cerr << "Error transferring the data to system memory: " << errbuf << " (" << err << ")" << std::endl;
+                             // Signal error so main() can trigger fallback
+                             cudaErrorOccurred = true;
                              av_frame_unref(frame.get());
-                             continue;
+                             return false; 
                          }
-                         // Copy/Setup properties
+                         // Propagate timestamp/properties to SW frame
                          swFrame->pts = frame->pts;
                          swFrame->best_effort_timestamp = frame->best_effort_timestamp;
                          processingFrame = swFrame.get();
                     }
 
-                    // Init/Re-init SwsContext if format changed or first time
+                    // Dynamically Initialize/Update Scaling Context
+                    // We check if dimensions or format have changed to handle dynamic resolution changes
                     if (!swsCtx || 
                         currentSwsW != processingFrame->width || 
                         currentSwsH != processingFrame->height ||
@@ -333,7 +399,7 @@ public:
                         currentSwsFormat = (enum AVPixelFormat)processingFrame->format;
                     }
 
-                    // Scale/Convert to YUV420P
+                    // Convert frame to YUV420P
                     int h = sws_scale(swsCtx.get(),
                         processingFrame->data, processingFrame->linesize,
                         0, processingFrame->height,
@@ -345,6 +411,7 @@ public:
                     else {
                         int64_t pts = (processingFrame->pts != AV_NOPTS_VALUE) ? processingFrame->pts : processingFrame->best_effort_timestamp;
                         
+                        // Sample frames based on interval
                         if (frameCount % frameInterval == 0) {
                             processAndWriteFrame(scaledFrame.get(), pts);
                             
@@ -360,6 +427,7 @@ public:
             av_packet_unref(packet.get());
         }
 
+        // Finalize statistics
         metadata.totalFrames = savedFrameCount;
         totalProcessedFrames = frameCount; 
 
@@ -369,39 +437,32 @@ public:
         return true;
     }
 
-private:
-    struct SwsContextWrapper {
-        SwsContext* ctx = nullptr;
-        int sourceW = 0;
-        int sourceH = 0;
-        ~SwsContextWrapper() { if (ctx) sws_freeContext(ctx); }
-        void reset(SwsContext* c, int w, int h) {
-            if (ctx) sws_freeContext(ctx);
-            ctx = c;
-            sourceW = w;
-            sourceH = h;
-        }
-        SwsContext* get() { return ctx; }
-        operator bool() { return ctx != nullptr; }
-    };
-    // Shadowing the smart ptr with this simple wrapper to track dims if needed, 
-    // but for now I'll stick to the smart ptr and re-create if needed.
-    // Re-using the class member swsCtx.
+    /**
+     * @brief Checks if a CUDA error occurred during processing.
+     * @return true if an unrecoverable CUDA error happened.
+     */
+    bool hasCudaError() const { return cudaErrorOccurred; }
 
+private:
+    /**
+     * @brief Writes the initial file header with placeholder values.
+     */
     void writeHeader() {
         const char* magic = "IGEDLT2";
         ofs.write(magic, 8);
 
         headerPos = ofs.tellp();
         
-        // Metadata placeholder
+        // Write placeholders for metadata and frame count.
+        // We will seek back here to overwrite with real values later.
         ofs.write(reinterpret_cast<const char*>(&metadata), sizeof(VideoMetadata));
-
-        // Frame count placeholder
         uint32_t count = 0;
         ofs.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
     }
 
+    /**
+     * @brief Finalizes the file by writing the correct metadata and frame counts.
+     */
     void finalizeFile() {
         if (!ofs) return;
 
@@ -414,6 +475,12 @@ private:
         ofs.close();
     }
 
+    /**
+     * @brief Analyzes a YUV420P frame and compresses it.
+     * 
+     * @param frame The AVFrame containing YUV420P data.
+     * @param pts Presentation Timestamp.
+     */
     void processAndWriteFrame(AVFrame* frame, int64_t pts) {
         int w = metadata.width;
         int h = metadata.height;
@@ -427,8 +494,9 @@ private:
         std::vector<uint8_t> currentFrame(totalSize);
         uint8_t* dst = currentFrame.data();
 
+        // Flatten planar YUV data into a single continuous buffer
+        
         // Copy Y plane
-        // frame->data[0] is Y, linesize[0] is stride
         for (int i = 0; i < h; i++) {
             memcpy(dst + i * w, frame->data[0] + i * frame->linesize[0], w);
         }
@@ -445,23 +513,20 @@ private:
             memcpy(dst + i * uvw, frame->data[2] + i * frame->linesize[2], uvw);
         }
 
-        // Now currentFrame contains tightly packed YUV data
+        // Determine frame type (Keyframe vs Delta)
         uint8_t frameType = 0;
         std::vector<uint8_t> compressedData;
-
         bool shouldBeKeyframe = (savedFrameCount % keyframeInterval == 0);
 
         if (lastFrame.empty() || shouldBeKeyframe) {
             frameType = 1; // Keyframe
             compressedData = compressKeyframe(currentFrame);
-            
             keyframeCount++;
             totalKeyframeBytes += compressedData.size();
         }
         else {
             frameType = 0; // Delta
             compressedData = compressDelta(currentFrame, lastFrame);
-            
             totalDeltaBytes += compressedData.size();
         }
 
@@ -471,6 +536,9 @@ private:
         savedFrameCount++;
     }
 
+    /**
+     * @brief Writes a single compressed frame packet to disk.
+     */
     void writeFrameToDisk(int64_t pts, uint8_t frameType, const std::vector<uint8_t>& data) {
         ofs.write(reinterpret_cast<const char*>(&pts), sizeof(int64_t));
         ofs.write(reinterpret_cast<const char*>(&frameType), sizeof(uint8_t));
@@ -480,10 +548,12 @@ private:
         ofs.write(reinterpret_cast<const char*>(data.data()), data.size());
     }
 
+    /**
+     * @brief Compresses data using Run-Length Encoding (RLE).
+     */
     std::vector<uint8_t> compressKeyframe(const std::vector<uint8_t>& data) {
-        // Reuse existing RLE logic - it works on any byte byte sequence
         std::vector<uint8_t> compressed;
-        compressed.reserve(data.size() / 2); // Better estimate for YUV
+        compressed.reserve(data.size() / 2);
 
         size_t i = 0;
         while (i < data.size()) {
@@ -493,12 +563,14 @@ private:
             }
 
             if (runLen >= 4) {
+                // RLE Sequence: Marker(0xFF) + Length + Value
                 compressed.push_back(0xFF);
                 compressed.push_back(static_cast<uint8_t>(runLen));
                 compressed.push_back(data[i]);
                 i += runLen;
             }
             else {
+                // Literal Sequence
                 size_t literalStart = i;
                 size_t literalLen = 0;
                 while (i < data.size() && literalLen < 127) {
@@ -517,6 +589,9 @@ private:
         return compressed;
     }
 
+    /**
+     * @brief Compresses data using a threshold-based Delta algorithm.
+     */
     std::vector<uint8_t> compressDelta(const std::vector<uint8_t>& current, const std::vector<uint8_t>& previous) {
         std::vector<uint8_t> compressed;
         compressed.reserve(current.size() / 10);
@@ -525,6 +600,7 @@ private:
         size_t frameSize = current.size();
 
         while (i < frameSize) {
+            // Skip pixels with changes below threshold
             while (i < frameSize &&
                 std::abs(static_cast<int>(current[i]) - static_cast<int>(previous[i])) < changeThreshold) {
                 i++;
@@ -535,6 +611,7 @@ private:
             size_t changeStart = i;
             std::vector<int8_t> deltas;
 
+            // Collect consecutive changes
             while (i < frameSize && deltas.size() < 255) {
                 int diff = static_cast<int>(current[i]) - static_cast<int>(previous[i]);
                 if (std::abs(diff) >= changeThreshold) {
@@ -543,6 +620,7 @@ private:
                     i++;
                 }
                 else {
+                    // Allow small gaps to keep runs together
                     if (deltas.size() >= 3) break;
                     if (i - changeStart < 5) {
                         deltas.push_back(0);
@@ -554,6 +632,7 @@ private:
 
             if (deltas.empty()) continue;
 
+            // Write change packet: Position (VarInt) + Length + Delta Values
             writeVarint(compressed, changeStart);
             compressed.push_back(static_cast<uint8_t>(deltas.size()));
             for (int8_t delta : deltas) compressed.push_back(static_cast<uint8_t>(delta));
@@ -561,6 +640,9 @@ private:
         return compressed;
     }
 
+    /**
+     * @brief Writes a variable-length integer (VarInt) to the buffer.
+     */
     void writeVarint(std::vector<uint8_t>& out, size_t value) {
         while (value >= 0x80) {
             out.push_back(static_cast<uint8_t>((value & 0x7F) | 0x80));
@@ -586,10 +668,8 @@ private:
 
         std::cout << "\nCompressed video saved to: " << outputFile << std::endl;
 
-        // Raw size for YUV420P is W * H * 1.5 per frame
-        // Safely calculate: (W * H * 3) / 2
         uint64_t pixels = static_cast<uint64_t>(metadata.width) * metadata.height;
-        uint64_t originalSize = (pixels * 3 * totalProcessedFrames) / 2;
+        uint64_t originalSize = (pixels * 3 * totalProcessedFrames) / 2; // YUV420P ratio
         
         double compressedSizeMB = MP4FileSize(outputFile);
         double inputFileMB = MP4FileSize(inputFile);
@@ -623,6 +703,9 @@ private:
     }
 };
 
+/**
+ * @brief Application Entry Point
+ */
 int main(int argc, char* argv[]) {
     std::cout << "Start of program" << std::endl;
 
@@ -660,18 +743,32 @@ int main(int argc, char* argv[]) {
 
     auto startTime = std::chrono::high_resolution_clock::now();
     
-    {
+    // Robust Execution with Retry Mechanism
+    // Attempts to run with requested settings. If CUDA fails, it automatically falls back
+    // to software decoding to ensure the user gets a result.
+    while (true) {
         VideoCompressor compressor(inputFile, outputFile, frameInterval, keyframeInterval, changeThreshold, useCuda);
 
         if (!compressor.initialize()) {
             std::cerr << "Failed to initialize compressor" << std::endl;
+            if (useCuda) {
+                std::cout << "Retrying with Software Decoding..." << std::endl;
+                useCuda = false;
+                continue;
+            }
             return 1;
         }
 
         if (!compressor.compress()) {
             std::cerr << "Compression failed" << std::endl;
+            if (useCuda && compressor.hasCudaError()) {
+                std::cout << "CUDA Error detected. Retrying with Software Decoding..." << std::endl;
+                useCuda = false;
+                continue;
+            }
             return 1;
         }
+        break; // Success
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
