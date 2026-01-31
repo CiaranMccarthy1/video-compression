@@ -14,6 +14,8 @@ void printHelp(const char* progName) {
     std::cout << "  --cuda             Enable CUDA hardware acceleration (NVIDIA only)" << std::endl;
     std::cout << "  --width <W>        Resize video to target width" << std::endl;
     std::cout << "  --height <H>       Resize video to target height" << std::endl;
+    std::cout << "  --in-width <W>     Input width (required for raw .yuv)" << std::endl;
+    std::cout << "  --in-height <H>    Input height (required for raw .yuv)" << std::endl;
     std::cout << "  --quantize <0-4>   Bit-shift quantization for noise reduction (default: 0)" << std::endl;
     std::cout << "  --interval <N>     Process every Nth frame (default: 10)" << std::endl;
     std::cout << "  --keyframe <N>     Insert a keyframe every N saved frames (default: 30)" << std::endl;
@@ -30,6 +32,8 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> args;
     int targetWidth = 0;
     int targetHeight = 0;
+    int inputWidth = 0;
+    int inputHeight = 0;
     int quantization = 0;
     int frameInterval = 10;
     int keyframeInterval = 48;
@@ -46,6 +50,10 @@ int main(int argc, char* argv[]) {
             targetWidth = std::stoi(argv[++i]);
         } else if (arg == "--height" && i + 1 < argc) {
             targetHeight = std::stoi(argv[++i]);
+        } else if (arg == "--in-width" && i + 1 < argc) {
+            inputWidth = std::stoi(argv[++i]);
+        } else if (arg == "--in-height" && i + 1 < argc) {
+            inputHeight = std::stoi(argv[++i]);
         } else if (arg == "--quantize" && i + 1 < argc) {
             quantization = std::stoi(argv[++i]);
         } else if (arg == "--interval" && i + 1 < argc) {
@@ -93,7 +101,7 @@ int main(int argc, char* argv[]) {
     // to software decoding to ensure the user gets a result.
     while (true) {
         VideoCompressor compressor(inputFile, outputFile, frameInterval, keyframeInterval, changeThreshold, 
-            targetWidth, targetHeight, quantization, useCuda);
+            targetWidth, targetHeight, inputWidth, inputHeight, quantization, useCuda);
 
         if (!compressor.initialize()) {
             std::cerr << "Failed to initialize compressor" << std::endl;

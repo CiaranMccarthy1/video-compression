@@ -35,6 +35,8 @@ class VideoCompressor {
 private:
     std::string inputFile;
     std::string outputFile;
+    int inputWidth;   // For raw YUV
+    int inputHeight;  // For raw YUV
     int frameInterval;
     int keyframeInterval;
     int changeThreshold;
@@ -83,12 +85,14 @@ public:
      * @param threshold Delta threshold (difference required to register a pixel change).
      * @param targetW Target width (0/negative for input width).
      * @param targetH Target height (0/negative for input height).
+     * @param inputW Forced input width (for raw YUV).
+     * @param inputH Forced input height (for raw YUV).
      * @param quantize Bit-shift quantization (0-4) to reduce noise and improve runs.
      * @param cuda Whether to attempt CUDA hardware acceleration.
      */
     VideoCompressor(const std::string& input, const std::string& output,
         int interval, int kfInterval, int threshold, 
-        int targetW, int targetH, int quantize, bool cuda);
+        int targetW, int targetH, int inputW, int inputH, int quantize, bool cuda);
 
     ~VideoCompressor();
 

@@ -71,3 +71,8 @@ external/
 # Package management
 conaninfo.txt
 conanbuildinfo.*
+
+# project specific
+*.ige
+*.yuv
+*.mp4

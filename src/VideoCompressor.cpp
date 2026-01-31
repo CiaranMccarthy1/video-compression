@@ -37,10 +37,11 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
 // -----------------------------------------------------------------------------
 
 VideoCompressor::VideoCompressor(const std::string& input, const std::string& output,
-    int interval, int kfInterval, int threshold, int dstW, int dstH, int quantize, bool cuda)
+    int interval, int kfInterval, int threshold, int dstW, int dstH, int inputW, int inputH, int quantize, bool cuda)
     : inputFile(input), outputFile(output), frameInterval(interval),
     keyframeInterval(kfInterval), changeThreshold(threshold), 
-    targetWidth(dstW), targetHeight(dstH), quantization(quantize), useCuda(cuda) {
+    targetWidth(dstW), targetHeight(dstH), inputWidth(inputW), inputHeight(inputH),
+    quantization(quantize), useCuda(cuda) {
     if (quantization < 0) quantization = 0;
     if (quantization > 4) quantization = 4;
 }
@@ -55,10 +56,27 @@ bool VideoCompressor::initialize() {
 
     // Open input file
     AVFormatContext* rawFmtCtx = nullptr;
-    if (avformat_open_input(&rawFmtCtx, inputFile.c_str(), nullptr, nullptr) < 0) {
+    AVDictionary* options = nullptr;
+
+    // Check for raw YUV file
+    if (inputFile.size() >= 4 && inputFile.substr(inputFile.size() - 4) == ".yuv") {
+        if (inputWidth > 0 && inputHeight > 0) {
+            std::string sizeStr = std::to_string(inputWidth) + "x" + std::to_string(inputHeight);
+            av_dict_set(&options, "video_size", sizeStr.c_str(), 0);
+            av_dict_set(&options, "pixel_format", "yuv420p", 0); // Assume standard I420 for raw .yuv
+            std::cout << "[Info] Opening raw YUV file: " << sizeStr << " @ yuv420p" << std::endl;
+        } else {
+            std::cerr << "[Error] Raw YUV input requires --in-width and --in-height to be specified." << std::endl;
+            return false;
+        }
+    }
+
+    if (avformat_open_input(&rawFmtCtx, inputFile.c_str(), nullptr, &options) < 0) {
         std::cerr << "Could not open input file: " << inputFile << std::endl;
+        if (options) av_dict_free(&options);
         return false;
     }
+    if (options) av_dict_free(&options);
     fmtCtx.reset(rawFmtCtx);
 
     // Retrieve stream information
