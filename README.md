@@ -65,3 +65,7 @@ cd build
 cmake ..
 cmake --build . --config Release
 ```
+
+## Next Update
+
+The next update will allow you to view .ige files in vlc
